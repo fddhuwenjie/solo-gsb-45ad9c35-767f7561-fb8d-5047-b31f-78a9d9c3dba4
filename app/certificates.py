@@ -139,6 +139,24 @@ CREATE TABLE IF NOT EXISTS cross_batch_plans (
     plan_body       TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
+-- Measured judgements of a saved cross-batch comparison plan. Each row pins
+-- the source certificate revisions/digests the judgement was confirmed
+-- against (copied from the plan at judgement time) together with the full
+-- target-plate scan, per-well readings, allowed deviation and the per-pair
+-- results; the idempotency record is written in the same transaction.
+CREATE TABLE IF NOT EXISTS cross_batch_readings (
+    reading_id          TEXT PRIMARY KEY,
+    plan_id             TEXT NOT NULL,
+    request_key         TEXT NOT NULL,
+    baseline_batch_id   TEXT NOT NULL,
+    allowed_deviation   REAL NOT NULL,
+    verdict             TEXT NOT NULL CHECK (verdict IN ('PASS', 'FAIL')),
+    sources             TEXT NOT NULL,
+    scan                TEXT NOT NULL,
+    readings            TEXT NOT NULL,
+    result_body         TEXT NOT NULL,
+    created_at          TEXT NOT NULL
+);
 """
 
 
