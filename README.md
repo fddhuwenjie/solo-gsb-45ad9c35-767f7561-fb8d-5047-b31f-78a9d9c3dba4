@@ -34,6 +34,7 @@ docker compose up --build
 - 证书重核验： `POST http://localhost:8000/api/v1/certificates/reverify`
 - 复测抽样计划： `POST http://localhost:8000/api/v1/certificates/retest-plans`
 - 跨批次对照排板计划： `POST http://localhost:8000/api/v1/certificates/cross-batch-plans`
+- 跨批次对照实测判读： `POST http://localhost:8000/api/v1/certificates/cross-batch-readings`
 
 不使用 Docker 时（Python 3.11+):
 
@@ -1025,6 +1026,166 @@ curl -X POST http://localhost:8000/api/v1/certificates/cross-batch-plans \
 内容相关的 422（结构缺漏、样本不可用、容量不足、孔位非法）会像普通响应一样记录
 在键上，重放返回同一 422。
 
+## 跨批次对照实测判读 `POST /api/v1/certificates/cross-batch-readings`
+
+对一份**已保存的跨批次对照排板计划**提交目标板的**完整扫描**与**逐孔实测读数**,
+产生可追溯的 `PASS`/`FAIL` 判读。调用方提交 `plan_id`、幂等键 `request_key`、
+基准 `batch_id`（每个 comparison 都以该批次成员为基准，与其他批次**逐对**比较）、
+目标板完整 `scan`（孔位 → 限定样本标识 `"<batch_id>:<sample_id>"`，**空孔不
+列出**；样本 id 与计划 `layout` 的键一致）、按目标孔位记录的 `readings` 与
+允许偏差 `allowed_offset`。
+
+服务在**同一 SQLite 事务**中先做**来源核对**（早于幂等查表，因此来源变化后
+旧判读也不能继续回放）:
+
+- `plan_id` 必须能找到已保存计划（否则 404 `CROSS_BATCH_PLAN_NOT_FOUND`);
+- 计划的**每个来源批次**证书必须仍存在且为 **ACTIVE**（缺失 404
+  `CERTIFICATE_NOT_FOUND`，吊销 409 `CERTIFICATE_REVOKED`);
+- 每个来源证书的**当前 revision** 必须仍等于计划钉住的 revision（推进即 409
+  `CERTIFICATE_REVISION_MISMATCH`，附 `current_revision`/`expected_revision`);
+- 该 revision **不可变冻结快照的 `digest`** 必须仍等于计划钉住的 digest
+  （变化即 409 `CERTIFICATE_DIGEST_MISMATCH`);
+- 逐样本**重新核对归属**：样本必须仍在其来源板计划孔上、冻结 `scan` 中恰好
+  仍由该样本占据、且该孔具有冻结的有限读数（不满足即 409
+  `CROSS_BATCH_SAMPLE_ATTRIBUTION_MISMATCH`)。
+
+任一来源证书**吊销或版本变化**（revision/digest）都返回 409;**这些状态相关
+拒绝不占用 `request_key`**。
+
+随后做**内容核对**（任一不满足即 422，**不保存判读**，响应列出全部问题、
+`misplaced_wells` 与 `cycles`):
+
+- 基准批次必须是计划参与批次（`XREAD_BASELINE_UNKNOWN`);
+- 完整 `scan` 与计划 `layout` 必须逐孔吻合（复用放行核验的全部纠位规则：
+  缺孔 `SAMPLES_MISSING`、计划外样本 `UNPLANNED_SAMPLES`、扫描孔/样本重复、
+  空孔链与闭环错位 `SCAN_LAYOUT_MISMATCH`/`CLOSED_LOOP_MISPLACEMENT`、禁用孔
+  占用 `BLOCKED_WELL_OCCUPIED`、孔位非法 `WELL_REFERENCE_INVALID`);
+- **每个计划孔必须有恰好一个有限读数**（省略或显式 `null` 即
+  `XREAD_READING_MISSING`);**计划外孔不得出现读数**
+  (`XREAD_READING_EXTRA`)；同一孔位（大小写不敏感）重复列读数为
+  `XREAD_READING_DUPLICATED`;`NaN`/`Infinity` 为 `REQUEST_VALIDATION_ERROR`。
+
+有效请求按 `comparison_id` 逐对判读：对每个 comparison，基准成员与其他每个批次
+成员组成一对（3 个批次时每个 comparison 有 2 对），同号计算
+
+- **来源证书读数差** `source_delta = 来源读数(其他) − 来源读数(基准)`
+  （取自各批次当前 revision 冻结快照中样本原孔的读数）;
+- **目标板读数差** `target_delta = 目标读数(其他) − 目标读数(基准)`;
+- **偏移绝对值** `offset = |target_delta − source_delta|`。
+
+`offset ≤ allowed_offset`（边界相等算通过）该对才 `passed`;**全部对通过才给
+`PASS`，否则 `FAIL`**。完整扫描、读数、确认后的**来源版本**（逐批次
+certificate_id/revision/digest）与**逐对结果**随结论及幂等记录在**同一 SQLite
+事务**中保存；同键同内容重放原结果（201 与响应体完全一致），换内容返回 409
+`REQUEST_KEY_CONFLICT`。
+
+端口 `8000` 调用示例（先经
+`/api/v1/certificates/cross-batch-plans` 取得 `plan_id`):
+
+```bash
+curl -X POST http://localhost:8000/api/v1/certificates/cross-batch-readings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "plan_id": "xplan-7d2a1f0c9b4e5a68",
+    "request_key": "xread-2026-0001",
+    "baseline_batch_id": "B2026-0042",
+    "scan": {
+      "B4": "B2026-0042:S042-01",
+      "B5": "B2026-0051:S051-07",
+      "C4": "B2026-0042:S042-02",
+      "C5": "B2026-0051:S051-08"
+    },
+    "readings": {
+      "B4": 102.30, "B5": 101.92,
+      "C4": 99.40,  "C5": 99.05
+    },
+    "allowed_offset": 0.5
+  }'
+```
+
+### 请求字段
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `plan_id` | string | 已保存的跨批次对照排板计划 id（`xplan-…`) |
+| `request_key` | string | **幂等键**：同键同内容重放已记录结论，同键不同内容返回 409 |
+| `baseline_batch_id` | string | 基准批次标识，必须是计划参与批次；逐对比较以该批次成员为基准 |
+| `scan` | object | 目标板**完整扫描**：孔位 → `"<batch_id>:<sample_id>"`，空孔不列出；必须与计划逐孔一致 |
+| `readings` | object | 按目标孔位记录的读数：孔位 → 有限数值；每个计划孔恰好一个，计划外孔列出即拒绝；`null` 视为缺读数 |
+| `allowed_offset` | float | 允许偏差（>0，必填，有限）：`|目标读数差 − 来源读数差|` 不超过它该对才通过 |
+
+### 判读成功（201,`verdict = "PASS"`/`"FAIL"`)
+
+```json
+{
+  "verdict_id": "xverdict-2f8c11a9d0b34e77",
+  "plan_id": "xplan-7d2a1f0c9b4e5a68",
+  "status": "ACTIVE",
+  "request_key": "xread-2026-0001",
+  "verdict": "PASS",
+  "baseline_batch_id": "B2026-0042",
+  "allowed_offset": 0.5,
+  "plate": {"type": "96", "rows": 8, "columns": 12, "blocked_wells": ["A1", "H12"]},
+  "scan": {"B4": "B2026-0042:S042-01", "B5": "B2026-0051:S051-07", "...": "..."},
+  "readings": {"B4": 102.3, "B5": 101.92, "C4": 99.4, "C5": 99.05},
+  "source_versions": [
+    {"batch_id": "B2026-0042", "certificate_id": "cert-21c5d55aee34",
+     "revision": 2, "digest": "9d1c0e4b7a2f...", "status": "ACTIVE"},
+    {"batch_id": "B2026-0051", "certificate_id": "cert-88a13b7c02f9",
+     "revision": 1, "digest": "3f60aa219d44...", "status": "ACTIVE"}
+  ],
+  "comparisons": [
+    {"comparison_id": "PAIR-A", "baseline_batch_id": "B2026-0042", "passed": true,
+     "pairs": [
+       {"other_batch_id": "B2026-0051",
+        "baseline": {"batch_id": "B2026-0042", "sample_id": "S042-01",
+                     "qualified_sample_id": "B2026-0042:S042-01",
+                     "group": "treated", "target_well": "B4",
+                     "source_well": "A1", "source_reading": 100.12,
+                     "revision": 2, "digest": "9d1c0e4b7a2f...",
+                     "certificate_id": "cert-21c5d55aee34"},
+        "other": {"batch_id": "B2026-0051", "sample_id": "S051-07",
+                  "qualified_sample_id": "B2026-0051:S051-07",
+                  "target_well": "B5", "source_well": "B2",
+                  "source_reading": 99.80, "revision": 1,
+                  "digest": "3f60aa219d44...",
+                  "certificate_id": "cert-88a13b7c02f9"},
+        "baseline_source_reading": 100.12,
+        "other_source_reading": 99.80,
+        "source_reading_delta": -0.32,
+        "baseline_target_reading": 102.30,
+        "other_target_reading": 101.92,
+        "target_reading_delta": -0.38,
+        "offset_abs": 0.06,
+        "allowed_offset": 0.5,
+        "passed": true}
+     ]}
+  ],
+  "summary": {
+    "total_pairs": 2, "passed_pairs": 2, "failed_pairs": 0,
+    "max_offset_abs": 0.11, "allowed_offset": 0.5, "verdict": "PASS"
+  }
+}
+```
+
+- `scan`/`readings`：按规范孔名、行主序回显的**完整提交证据**;
+- `source_versions[]`：判读时逐来源确认的 `certificate_id`/`revision`/`digest`;
+- `comparisons[].pairs[]`：基准 vs 其他批次逐对结果，含两端的来源读数、目标
+  读数、同号差值、偏移绝对值与 `passed`;3–4 个批次时每对含多个 `pairs`;
+- `summary`：通过/失败对数、最大偏移绝对值与总体 `verdict`。
+
+### 不产生判读的情形
+
+| 状态码 | 情形 |
+| --- | --- |
+| 404 | `plan_id` 无已保存计划（`CROSS_BATCH_PLAN_NOT_FOUND`)，或计划的某来源证书已不存在（`CERTIFICATE_NOT_FOUND`，附 `batch_id`) |
+| 409 | 某来源证书已吊销（`CERTIFICATE_REVOKED`，**吊销不可逆**)、当前 revision 与计划钉住值不符（`CERTIFICATE_REVISION_MISMATCH`)、revision 快照 digest 变化（`CERTIFICATE_DIGEST_MISMATCH`)、成员样本无法在快照中重新归属（`CROSS_BATCH_SAMPLE_ATTRIBUTION_MISMATCH`)，或 `request_key` 曾被不同内容（含其他证书接口）使用（`REQUEST_KEY_CONFLICT`)。**来源变化后即使同键重放旧判读也返回 409，不回放旧结论** |
+| 422 | 基准批次不在计划中、扫描与计划不符（缺孔/计划外/重复/空孔链/闭环/禁用孔占用/孔位非法）、计划孔缺有限读数、出现额外/重复读数、请求结构非法；**均不保存判读**；内容相关 422 与普通响应一样记录在键上，重放返回同一 422 |
+
+幂等与事务语义与其他证书接口一致：**同键同内容重放原结果**（含 PASS/FAIL,
+不重复写入判读行）;**同键不同内容 409**；读取计划与各证书状态、核对
+revision/digest/归属、写入判读与幂等记录全部在**同一 SQLite 事务**中完成。
+
 ## 稀释梯度配制计划 `POST /api/v1/arrangements/dilution-plan`
 
 为**既有编排结果**（编排接口响应中的 `layout`，即 sample_id → well 映射）
@@ -1376,6 +1537,12 @@ curl -X POST http://localhost:8000/api/v1/blinding/unblind \
   快照,对照清单,目标板,禁用孔,seed)必然得到逐孔一致的布局、相邻边清单与覆盖
   指标。所有批次证书的状态核对、revision 快照确认、计划写入与幂等记录在同一
   SQLite 事务内完成;任一批次 revision 过期或样本在快照中错位/缺读数即整次失败。
+- 跨批次对照实测判读是纯算术(无随机源):同号差值与偏移绝对值
+  (`|目标读数差 − 来源证书读数差|`)由提交读数与各来源 revision 冻结快照读数
+  唯一确定,边界值(偏移恰好等于允许偏差)恒判通过。读取计划与各证书状态、
+  核对 revision/digest/样本归属、保存完整扫描/读数/来源版本/逐对结果/结论与
+  幂等记录在同一 SQLite 事务内完成;任一来源证书吊销或 revision/digest 变化,
+  即使同键重放也返回 409,旧判读绝不回放。
 
 ## 配置（环境变量）
 
@@ -1411,11 +1578,12 @@ app/
   certificates.py 批次证书:放行结果冻结快照（SQLite 单事务）、按 revision 追加不可变证据快照的重核验（通过则重算 digest,失败则吊销）、request_key 幂等
   retest.py    复测抽样计划:仅从有效读数且未排除样本中抽取,三阶段字典序 CP-SAT(覆盖行列 → 同批次相邻对 → seed 决胜),计划与幂等记录在证书同一 SQLite 事务内持久化
   cross_batch.py 跨批次对照排板:同一事务核对 2–4 个 ACTIVE 证书的当前 revision 与冻结快照(样本在计划孔、扫描吻合、读数有效),三阶段字典序 CP-SAT(同对照正交相邻边 → 批次/实验组覆盖行列 → seed 决胜),计划与幂等记录同事务持久化
+  cross_batch_verdicts.py 跨批次对照实测判读:同事务重新核对计划各来源证书的 ACTIVE/revision/digest 与样本归属(吊销或版本变化即 409,旧判读不可回放),校验完整扫描与逐孔有限读数(不符即 422 不保存),按 comparison_id 将基准批次与其他批次逐对比较(来源读数差/目标读数差/偏移绝对值,全部不超限才 PASS),完整证据、逐对结果、结论与幂等记录同事务持久化
   dilution.py  稀释梯度配制:共享库存核算 + 分辨率取整 + 容差校验,确定性逐步移液指令
   blinding.py  双人协作盲化/解盲:AES-256-GCM 认证加密映射包 + XOR 双份额
   metrics.py   指标独立重算与布局约束校验
   plates.py    板型预设与孔位命名解析
-tests/         pytest 测试（解析、求解、API、纠位、空间质控、批次放行、批次证书、复测抽样、跨批次对照排板、稀释计划、盲化解盲）
+tests/         pytest 测试（解析、求解、API、纠位、空间质控、批次放行、批次证书、复测抽样、跨批次对照排板、跨批次对照实测判读、稀释计划、盲化解盲）
 Dockerfile     单容器构建
 docker-compose.yml  单命令启动（含证书数据库命名卷）
 ```

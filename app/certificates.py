@@ -139,6 +139,23 @@ CREATE TABLE IF NOT EXISTS cross_batch_plans (
     plan_body       TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
+-- Measured-reading interpretations of a saved cross-batch comparison plan.
+-- Every row pins the plan, the baseline batch, the allowed offset and the
+-- exact source certificate revisions/digests confirmed at verdict time; it
+-- also stores the complete submitted scan/readings and the per-pair results
+-- together with the PASS/FAIL conclusion. The verdict row and the
+-- idempotency record commit in one SQLite transaction.
+CREATE TABLE IF NOT EXISTS cross_batch_verdicts (
+    verdict_id      TEXT PRIMARY KEY,
+    plan_id         TEXT NOT NULL,
+    request_key     TEXT NOT NULL,
+    baseline_batch_id TEXT NOT NULL,
+    allowed_offset  REAL NOT NULL,
+    verdict         TEXT NOT NULL CHECK (verdict IN ('PASS', 'FAIL')),
+    source_versions TEXT NOT NULL,
+    verdict_body    TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
 """
 
 

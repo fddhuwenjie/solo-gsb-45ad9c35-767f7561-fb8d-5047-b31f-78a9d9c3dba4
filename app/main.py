@@ -14,10 +14,11 @@ from .blinding import BlindInvalid, blind, unblind
 from .certificates import create_certificate, reverify_certificate
 from .retest import create_retest_plan
 from .cross_batch import create_cross_batch_plan
+from .cross_batch_verdicts import create_cross_batch_verdict
 from .dilution import DilutionPlanInvalid, dilution_plan
 from .reconciler import ReconcileInvalid, StagingConflict, reconcile
 from .release import ReleaseInvalid, batch_release, release_invalid_body
-from .schemas import ArrangeRequest, BatchReleaseRequest, BlindRequest, CertificateCreateRequest, CertificateReverifyRequest, CrossBatchPlanRequest, DilutionPlanRequest, ReconcileRequest, RetestPlanRequest, SpatialQCRequest, UnblindRequest
+from .schemas import ArrangeRequest, BatchReleaseRequest, BlindRequest, CertificateCreateRequest, CertificateReverifyRequest, CrossBatchPlanRequest, CrossBatchReadingRequest, DilutionPlanRequest, ReconcileRequest, RetestPlanRequest, SpatialQCRequest, UnblindRequest
 from .spatial_qc import SpatialQCInvalid, spatial_qc
 
 app = FastAPI(
@@ -399,4 +400,19 @@ async def create_batch_retest_plan(req: RetestPlanRequest) -> JSONResponse:
 )
 async def create_cross_batch_plan_endpoint(req: CrossBatchPlanRequest) -> JSONResponse:
     status, body = create_cross_batch_plan(req)
+    return JSONResponse(status_code=status, content=body)
+
+
+@app.post(
+    "/api/v1/certificates/cross-batch-readings",
+    summary="对已保存的跨批次对照排板计划提交完整扫描与逐孔读数,产生可追溯的 PASS/FAIL 实测判读",
+    responses={
+        201: {"description": "来源证书仍为计划钉住的 ACTIVE revision 且 digest 未变,扫描/读数与计划吻合;完整扫描、读数、来源版本与逐对结果随 PASS/FAIL 结论及幂等记录在同一 SQLite 事务保存"},
+        404: {"description": "plan_id 无对应已保存计划,或计划的某来源证书已不存在"},
+        409: {"description": "任一来源证书已吊销/revision 推进/digest 变化/样本归属无法核对,或 request_key 曾被不同内容使用;旧判读也不能继续回放,不保存判读"},
+        422: {"description": "基准批次不在计划中、扫描与计划不符(缺孔/计划外/错位/禁用孔占用/孔位非法)、计划孔缺少有限读数或出现额外/重复读数;不保存判读"},
+    },
+)
+async def create_cross_batch_reading_endpoint(req: CrossBatchReadingRequest) -> JSONResponse:
+    status, body = create_cross_batch_verdict(req)
     return JSONResponse(status_code=status, content=body)

@@ -100,6 +100,19 @@ VIOLATION_XCOMP_SAMPLE_NOT_ELIGIBLE = "XCOMP_SAMPLE_NOT_ELIGIBLE"
 VIOLATION_XCOMP_SAMPLE_DUPLICATED = "XCOMP_SAMPLE_DUPLICATED"
 VIOLATION_XCOMP_NO_SOLUTION = "XCOMP_NO_SOLUTION"
 
+# Error codes and content categories for the cross-batch measured-reading
+# interpretation endpoint. State-dependent refusals (unknown plan/certificate,
+# revoked/stale certificate, changed digest, attribution mismatch) are 404/409
+# and are not recorded under the request key; scan/reading content problems are
+# 422, are recorded under the key like any other response, and save no verdict.
+CROSS_BATCH_PLAN_NOT_FOUND = "CROSS_BATCH_PLAN_NOT_FOUND"
+CERTIFICATE_DIGEST_MISMATCH = "CERTIFICATE_DIGEST_MISMATCH"
+CROSS_BATCH_SAMPLE_ATTRIBUTION_MISMATCH = "CROSS_BATCH_SAMPLE_ATTRIBUTION_MISMATCH"
+VIOLATION_XREAD_BASELINE_UNKNOWN = "XREAD_BASELINE_UNKNOWN"
+VIOLATION_XREAD_READING_MISSING = "XREAD_READING_MISSING"
+VIOLATION_XREAD_READING_EXTRA = "XREAD_READING_EXTRA"
+VIOLATION_XREAD_READING_DUPLICATED = "XREAD_READING_DUPLICATED"
+
 
 class PlateSpec(BaseModel):
     """Plate geometry.
@@ -670,3 +683,67 @@ class CrossBatchPlanRequest(BaseModel):
         default_factory=list, description="目标板禁用孔位,不可放置任何样本"
     )
     seed: int = Field(default=0, ge=0, description="随机种子(≥0),控制确定性决胜")
+
+
+class CrossBatchReadingRequest(BaseModel):
+    """Measured-reading interpretation of a saved cross-batch comparison plan.
+
+    The caller names the saved ``plan_id`` (as returned by
+    ``POST /api/v1/certificates/cross-batch-plans``), an idempotency
+    ``request_key``, the baseline ``batch_id`` (every comparison is judged as
+    a baseline-vs-other-batch pair), the **complete** target-plate ``scan``
+    (well -> qualified sample id ``"<batch_id>:<sample_id>"``, empty wells
+    omitted), the per-well ``readings`` (finite, exactly one per planned well)
+    and the maximum allowed absolute offset ``allowed_offset``.
+
+    The service first re-confirms, inside one SQLite transaction, that every
+    source certificate is still ACTIVE at the revision the plan pinned and
+    that that revision snapshot's digest is unchanged (any revocation,
+    revision advance or digest change refuses the whole request with 409, so
+    a verdict confirmed against stale evidence can never be replayed). It
+    then checks the scan against the plan layout and the readings against
+    the planned wells (any mismatch is 422, nothing saved). For each
+    comparison the baseline member is paired with every other batch's member:
+    the source-certificate reading difference, the target-plate reading
+    difference and the absolute offset between them are computed; a pair
+    passes iff the offset is at most ``allowed_offset``. The verdict is PASS
+    only when every pair passes.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: str = Field(min_length=1, description="已保存的跨批次对照排板计划 id")
+    request_key: str = Field(
+        min_length=1, description="幂等键:同键同内容重放已记录结论,同键不同内容返回 409"
+    )
+    baseline_batch_id: str = Field(
+        min_length=1, description="基准批次标识;每个 comparison 以该批次成员为基准逐对比较"
+    )
+    scan: dict[str, str] = Field(
+        min_length=1,
+        description="目标板完整扫描:孔位 → 限定样本标识 \"<batch_id>:<sample_id>\",空孔不列出",
+    )
+    readings: dict[str, Optional[float]] = Field(
+        min_length=1,
+        description="按目标孔位记录的读数:孔位 → 有限数值;每个计划孔必须恰好一个,"
+        "省略或显式 null 视为缺少有限读数,计划外孔列读数视为额外读数",
+    )
+    allowed_offset: float = Field(
+        gt=0,
+        description="允许偏差(>0):目标板读数差与来源证书读数差的偏移绝对值不超过该值才通过该对",
+    )
+
+    @field_validator("allowed_offset")
+    @classmethod
+    def _allowed_offset_finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("allowed_offset must be a finite number")
+        return v
+
+    @field_validator("readings")
+    @classmethod
+    def _readings_finite(cls, v: dict[str, Optional[float]]) -> dict[str, Optional[float]]:
+        for well, value in v.items():
+            if value is not None and not math.isfinite(value):
+                raise ValueError(f"reading at well '{well}' must be a finite number or null")
+        return v
